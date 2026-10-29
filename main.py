@@ -3,108 +3,97 @@ import os
 import asyncio
 import logging
 import tempfile
+from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import yt_dlp
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
-import yt_dlp
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN Railway Variables'da yo'q")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger(__name__)
-
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Railway Variables: TELEGRAM_BOT_TOKEN yo'q")
-
-MAX_RESULTS = 20
+log = logging.getLogger("music_bot")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎵 Musiqa botiga xush kelibsiz!\n\n"
-        "Qo‘shiq yoki ijrochi nomini yozing.\n"
-        "Masalan: Eminem Mockingbird"
+        "🎵 Musiqa botiga xush kelibsiz!\n"
+        "Qo‘shiq nomini yuboring — bot eng mos natijani "
+        "topib, audio yuborishga urinadi."
     )
 
 
-def search_music_sync(query):
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "extract_flat": True,
-        "noplaylist": True,
-        "socket_timeout": 25,
-        "retries": 2,
-        "extractor_retries": 2,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info("ytsearch20:" + query, download=False)
+def search_candidates_sync(song_name):
+    """YouTube va SoundCloud'dan nom bo'yicha natijalarni qidiradi."""
+    candidates = []
+    sources = [
+        "ytsearch5:" + song_name,
+        "scsearch5:" + song_name,
+    ]
 
+    for search_term in sources:
+        try:
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "extract_flat": True,
+                "noplaylist": True,
+                "socket_timeout": 20,
+                "retries": 1,
+            }
 
-async def search_music(query):
-    data = await asyncio.to_thread(search_music_sync, query)
-    entries = (data or {}).get("entries") or []
-    return [
-        item for item in entries
-        if item and item.get("id") and item.get("title")
-    ][:MAX_RESULTS]
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                data = ydl.extract_info(search_term, download=False)
 
+            for item in (data or {}).get("entries") or []:
+                if not item or not item.get("title"):
+                    continue
 
-async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = (update.message.text or "").strip()
-    if not query:
-        return
+                url = item.get("webpage_url") or item.get("url")
 
-    status = await update.message.reply_text("🔎 Qo‘shiq qidirilmoqda...")
+                if not url:
+                    item_id = item.get("id")
+                    if item_id and "youtube" in search_term:
+                        url = "https://www.youtube.com/watch?v=" + item_id
 
-    try:
-        results = await search_music(query)
+                if url:
+                    candidates.append({
+                        "title": item["title"],
+                        "url": url,
+                        "source": search_term.split(":")[0],
+                    })
 
-        if not results:
-            await status.edit_text(
-                "Natija topilmadi. Boshqa qo‘shiq nomi bilan urinib ko‘ring."
-            )
-            return
+        except Exception:
+            log.exception("Qidiruv manbasi ishlamadi: %s", search_term)
 
-        context.user_data["music_results"] = results
-        keyboard = []
+    # Dublikat natijalarni olib tashlash
+    unique = []
+    seen = set()
 
-        for i, item in enumerate(results):
-            title = item["title"]
-            if len(title) > 48:
-                title = title[:45] + "..."
+    for item in candidates:
+        key = item["url"]
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
 
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{i + 1}. {title}",
-                    callback_data=f"song:{i}",
-                )
-            ])
-
-        await status.edit_text(
-            f"🎶 {len(results)} ta natija topildi. Tanlang:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-
-    except Exception:
-        log.exception("YouTube qidiruv xatosi")
-        await status.edit_text(
-            "❌ Qidiruvda xato. Railway Deploy Logs'ni tekshiring."
-        )
+    return unique
 
 
 def download_audio_sync(url, folder):
-    output = os.path.join(folder, "audio.%(ext)s")
+    """Ruxsatli manbadagi audioni MP3 formatida yuklaydi."""
+    output = os.path.join(folder, "track.%(ext)s")
 
     opts = {
         "format": "bestaudio/best",
@@ -114,6 +103,7 @@ def download_audio_sync(url, folder):
         "no_warnings": True,
         "socket_timeout": 30,
         "retries": 2,
+        "extractor_retries": 1,
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -124,58 +114,98 @@ def download_audio_sync(url, folder):
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
-    for name in os.listdir(folder):
-        if name.endswith(".mp3"):
-            return os.path.join(folder, name)
+    files = list(Path(folder).glob("track*.mp3"))
+    if not files:
+        raise FileNotFoundError("Yuklangan MP3 fayl topilmadi")
 
-    raise FileNotFoundError("MP3 fayl topilmadi")
+    return str(files[0])
 
 
-async def select_song(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    song_name = (message.text or "").strip()
+
+    if not song_name:
+        return
+
+    status = await message.reply_text(
+        "🔎 Qo‘shiq qidirilmoqda..."
+    )
 
     try:
-        index = int(query.data.split(":")[1])
-        results = context.user_data.get("music_results", [])
+        candidates = await asyncio.to_thread(
+            search_candidates_sync, song_name
+        )
 
-        if index < 0 or index >= len(results):
-            await query.message.reply_text(
-                "Natijalar eskirgan. Qo‘shiqni qaytadan qidiring."
+        if not candidates:
+            await status.edit_text(
+                "❌ Qo‘shiq topilmadi. Boshqa nom bilan urinib ko‘ring."
             )
             return
 
-        item = results[index]
-        url = f"https://www.youtube.com/watch?v={item['id']}"
+        errors = []
 
-        status = await query.message.reply_text(
-            f"⬇️ Yuklanmoqda: {item['title']}"
-        )
-
-        with tempfile.TemporaryDirectory() as folder:
-            path = await asyncio.to_thread(download_audio_sync, url, folder)
-
-            with open(path, "rb") as audio:
-                await query.message.reply_audio(
-                    audio=audio,
-                    title=item["title"][:64],
-                    read_timeout=120,
-                    write_timeout=120,
-                    connect_timeout=30,
+        # Eng mos deb topilgan natijalardan boshlab sinaydi.
+        for number, item in enumerate(candidates[:10], start=1):
+            try:
+                await status.edit_text(
+                    f"⬇️ Audio olinmoqda ({number}/{min(len(candidates), 10)})\n"
+                    f"🎵 {item['title'][:150]}\n"
+                    f"Manba: {item['source']}"
                 )
 
-        await status.edit_text("✅ Audio yuborildi!")
+                with tempfile.TemporaryDirectory() as folder:
+                    path = await asyncio.to_thread(
+                        download_audio_sync, item["url"], folder
+                    )
+
+                    with open(path, "rb") as audio:
+                        await message.reply_audio(
+                            audio=audio,
+                            title=item["title"][:64],
+                            read_timeout=180,
+                            write_timeout=180,
+                            connect_timeout=30,
+                            pool_timeout=30,
+                        )
+
+                await status.edit_text(
+                    "✅ Audio yuborildi!"
+                )
+                return
+
+            except Exception as exc:
+                log.warning(
+                    "Natija %s ishlamadi (%s): %s",
+                    number, item["source"], exc,
+                )
+                errors.append(str(exc))
+
+        log.error("Barcha audio urinishlari muvaffaqiyatsiz: %s", errors)
+        await status.edit_text(
+            "❌ To‘liq audio yuklanmadi.\n\n"
+            "Sabab: manbalar yuklashga ruxsat bermadi yoki "
+            "audio formati mavjud emas.\n"
+            "Boshqa qo‘shiq nomi bilan urinib ko‘ring."
+        )
 
     except Exception:
-        log.exception("Audio yuklash xatosi")
-        await query.message.reply_text(
-            "❌ Audio yuklanmadi. Railway Deploy Logs'ni tekshiring."
+        log.exception("Musiqa qidirishda xato")
+        await status.edit_text(
+            "❌ Qidiruv xatosi. Railway Runtime Logs'ni tekshiring."
         )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Qo‘shiq nomini yozing, keyin ro‘yxatdan tanlang."
+    await update.effective_message.reply_text(
+        "Qo‘shiq nomini yozing. Bot mos audio topib yuborishga urinadi."
+    )
+
+
+async def error_handler(update, context):
+    log.error(
+        "Telegram bot xatosi",
+        exc_info=context.error,
     )
 
 
@@ -185,11 +215,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(
-        CallbackQueryHandler(select_song, pattern=r"^song:\d+$")
-    )
-    app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search)
     )
+    app.add_error_handler(error_handler)
 
     log.info("Musiqa bot ishga tushmoqda...")
     app.run_polling(drop_pending_updates=True)
