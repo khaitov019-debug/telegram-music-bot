@@ -116,103 +116,21 @@ async def handle_search(
 def download_audio_sync(url, folder):
     output = os.path.join(folder, "audio.%(ext)s")
     opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio",
         "outtmpl": output,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 30,
         "retries": 2,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
     }
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
     for name in os.listdir(folder):
-        if name.endswith(".mp3"):
+        if name.startswith("audio."):
             return os.path.join(folder, name)
 
     raise FileNotFoundError("Audio fayl topilmadi")
 
-
-async def select_song(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.callback_query
-    await query.answer()
-
-    try:
-        index = int(query.data.split(":")[1])
-        results = context.user_data.get("music_results", [])
-
-        if index < 0 or index >= len(results):
-            await query.message.reply_text(
-                "Natijalar eskirgan. Qo‘shiqni qaytadan qidiring."
-            )
-            return
-
-        item = results[index]
-        video_id = item["id"]
-        url = item.get("url")
-
-        if not url or not url.startswith("http"):
-            url = f"https://www.youtube.com/watch?v={video_id}"
-
-        await query.message.reply_text(
-            f"⬇️ Yuklanmoqda: {item['title']}"
-        )
-
-        with tempfile.TemporaryDirectory() as folder:
-            path = await asyncio.to_thread(
-                download_audio_sync, url, folder
-            )
-
-            with open(path, "rb") as audio:
-                await query.message.reply_audio(
-                    audio=audio,
-                    title=item["title"][:64],
-                    read_timeout=120,
-                    write_timeout=120,
-                    connect_timeout=30,
-                )
-
-    except Exception:
-        log.exception("Audio yuklash yoki yuborish xatosi")
-        await query.message.reply_text(
-            "❌ Audio yuklanmadi. Railway Deploy Logs'dagi "
-            "xatoni tekshirish kerak."
-        )
-
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.message.reply_text(
-        "Qo‘shiq nomini yozing — natijadan birini tanlang.\n"
-        "Bot tanlangan audio faylni yuborishga harakat qiladi."
-    )
-
-
-def main():
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(select_song, pattern=r"^song:\d+$"))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search)
-    )
-
-    log.info("Musiqa bot ishga tushmoqda...")
-    app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()
